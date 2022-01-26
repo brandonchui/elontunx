@@ -7,13 +7,17 @@
 #include <mavsdk/mavsdk.h>
 #include <mavsdk/plugins/action/action.h>
 #include <mavsdk/plugins/telemetry/telemetry.h>
+#include <mavsdk/plugins/camera/camera.h>
 #include <iostream>
 #include <future>
 #include <memory>
 #include <thread>
 
+#include <mavsdk/plugins/offboard/offboard.h>
+
 using namespace mavsdk;
 using std::chrono::seconds;
+using std::chrono::milliseconds;
 using std::this_thread::sleep_for;
 
 void usage(const std::string& bin_name)
@@ -26,6 +30,7 @@ void usage(const std::string& bin_name)
               << "For example, to connect to the simulator use URL: udp://:14540\n";
 }
 
+// system
 std::shared_ptr<System> get_system(Mavsdk& mavsdk)
 {
     std::cout << "Waiting to discover system...\n";
@@ -53,8 +58,289 @@ std::shared_ptr<System> get_system(Mavsdk& mavsdk)
         return {};
     }
 
+    //for cmaera lambda
+
+    mavsdk.subscribe_on_new_system([&mavsdk, &prom]() {
+            auto system = mavsdk.systems().back();
+            if (system->has_camera()) {
+                std::cout << "Discovered camera\n";
+
+                // Unsubscribe again as we only want to find one system.
+                mavsdk.subscribe_on_new_system(nullptr);
+                prom.set_value(system);
+            }
+        });
+    if (fut.wait_for(seconds(3)) == std::future_status::timeout) {
+            std::cerr << "No camera found, exiting.\n";
+            //return "Broken camera";
+            std::cout << "No camera...";
+        }
+
     // Get discovered system now.
     return fut.get();
+}
+
+//
+// Does Offboard control using NED co-ordinates.
+//
+// returns true if everything went well in Offboard control
+//
+bool offb_ctrl_ned(mavsdk::Offboard& offboard)
+{
+    std::cout << "Starting Offboard velocity control in NED coordinates\n";
+
+    // Send it once before starting offboard, otherwise it will be rejected.
+    const Offboard::VelocityNedYaw stay{};
+    offboard.set_velocity_ned(stay);
+
+    Offboard::Result offboard_result = offboard.start();
+    if (offboard_result != Offboard::Result::Success) {
+        std::cerr << "Offboard start failed: " << offboard_result << '\n';
+        return false;
+    }
+
+    std::cout << "Offboard started\n";
+    std::cout << "Turn to face East\n";
+
+    Offboard::VelocityNedYaw turn_east{};
+    turn_east.yaw_deg = 90.0f;
+    offboard.set_velocity_ned(turn_east);
+    sleep_for(seconds(1)); // Let yaw settle.
+
+    {
+        const float step_size = 0.01f;
+        const float one_cycle = 2.0f * (float)M_PI;
+        const unsigned steps = 2 * unsigned(one_cycle / step_size);
+
+        std::cout << "Go North and back South\n";
+
+        for (unsigned i = 0; i < steps; ++i) {
+            float vx = 5.0f * sinf(i * step_size);
+            Offboard::VelocityNedYaw north_and_back_south{};
+            north_and_back_south.north_m_s = vx;
+            north_and_back_south.yaw_deg = 90.0f;
+            offboard.set_velocity_ned(north_and_back_south);
+            sleep_for(milliseconds(10));
+        }
+    }
+
+    std::cout << "Turn to face West\n";
+    Offboard::VelocityNedYaw turn_west{};
+    turn_west.yaw_deg = 270.0f;
+    offboard.set_velocity_ned(turn_west);
+    sleep_for(seconds(2));
+
+    std::cout << "Go up 2 m/s, turn to face South\n";
+    Offboard::VelocityNedYaw up_and_south{};
+    up_and_south.down_m_s = -2.0f;
+    up_and_south.yaw_deg = 180.0f;
+    offboard.set_velocity_ned(up_and_south);
+    sleep_for(seconds(4));
+
+    std::cout << "Go down 1 m/s, turn to face North\n";
+    Offboard::VelocityNedYaw down_and_north{};
+    up_and_south.down_m_s = 1.0f;
+    offboard.set_velocity_ned(down_and_north);
+    sleep_for(seconds(4));
+
+    offboard_result = offboard.stop();
+    if (offboard_result != Offboard::Result::Success) {
+        std::cerr << "Offboard stop failed: " << offboard_result << '\n';
+        return false;
+    }
+    std::cout << "Offboard stopped\n";
+
+    return true;
+}
+
+//
+// Does Offboard control using Global (Latitude, Longitude, relative altitude) co-ordinates.
+//
+// returns true if everything went well in Offboard control
+//
+bool offb_ctrl_pos_global(mavsdk::Offboard& offboard, mavsdk::Telemetry& telemetry)
+{
+    std::cout << "Reading home position in Global coordinates\n";
+
+    const auto res_and_gps_origin = telemetry.get_gps_global_origin();
+    if (res_and_gps_origin.first != Telemetry::Result::Success) {
+        std::cerr << "Telemetry failed: " << res_and_gps_origin.first << '\n';
+    }
+    Telemetry::GpsGlobalOrigin origin = res_and_gps_origin.second;
+    std::cerr << "Origin (lat, lon, alt amsl):\n " << origin << '\n';
+
+    std::cout << "Starting Offboard position control in Global coordinates\n";
+
+    // Send it once before starting offboard, otherwise it will be rejected.
+    // this is a step north about 10m, using the default altitude type (altitude relative to home)
+    const Offboard::PositionGlobalYaw north{
+        origin.latitude_deg + 0.0001, origin.longitude_deg, 20.0f, 0.0f};
+    offboard.set_position_global(north);
+
+    Offboard::Result offboard_result = offboard.start();
+    if (offboard_result != Offboard::Result::Success) {
+        std::cerr << "Offboard start failed: " << offboard_result << '\n';
+        return false;
+    }
+
+    std::cout << "Offboard started\n";
+    std::cout << "Going North at 20m relative altitude\n";
+    sleep_for(seconds(10));
+
+    // here we use an explicit altitude type (relative to home)
+    const Offboard::PositionGlobalYaw east{
+        origin.latitude_deg + 0.0001,
+        origin.longitude_deg + 0.0001,
+        15.0f,
+        90.0f,
+        Offboard::PositionGlobalYaw::AltitudeType::RelHome};
+    offboard.set_position_global(east);
+    std::cout << "Going East at 15m relative altitude\n";
+    sleep_for(seconds(10));
+
+    // here we use the above mean sea level altitude
+    const Offboard::PositionGlobalYaw home{
+        origin.latitude_deg,
+        origin.longitude_deg,
+        origin.altitude_m + 10.0f,
+        180.0f,
+        Offboard::PositionGlobalYaw::AltitudeType::Amsl};
+    offboard.set_position_global(home);
+    std::cout << "Going Home facing south at " << (origin.altitude_m + 10.0f)
+              << "m AMSL altitude\n";
+    sleep_for(seconds(10));
+
+    offboard_result = offboard.stop();
+    if (offboard_result != Offboard::Result::Success) {
+        std::cerr << "Offboard stop failed: " << offboard_result << '\n';
+        return false;
+    }
+    std::cout << "Offboard stopped\n";
+
+    return true;
+}
+
+//
+// Does Offboard control using body co-ordinates.
+// Body coordinates really means world coordinates rotated by the yaw of the
+// vehicle, so if the vehicle pitches down, the forward axis does still point
+// forward and not down into the ground.
+//
+// returns true if everything went well in Offboard control.
+//
+bool offb_ctrl_body(mavsdk::Offboard& offboard)
+{
+    std::cout << "Starting Offboard velocity control in body coordinates\n";
+
+    // Send it once before starting offboard, otherwise it will be rejected.
+    Offboard::VelocityBodyYawspeed stay{};
+    offboard.set_velocity_body(stay);
+
+    Offboard::Result offboard_result = offboard.start();
+    if (offboard_result != Offboard::Result::Success) {
+        std::cerr << "Offboard start failed: " << offboard_result << '\n';
+        return false;
+    }
+    std::cout << "Offboard started\n";
+
+    std::cout << "Turn clock-wise and climb\n";
+    Offboard::VelocityBodyYawspeed cc_and_climb{};
+    cc_and_climb.down_m_s = -1.0f;
+    cc_and_climb.yawspeed_deg_s = 60.0f;
+    offboard.set_velocity_body(cc_and_climb);
+    sleep_for(seconds(5));
+
+    std::cout << "Turn back anti-clockwise\n";
+    Offboard::VelocityBodyYawspeed ccw{};
+    ccw.down_m_s = -1.0f;
+    ccw.yawspeed_deg_s = -60.0f;
+    offboard.set_velocity_body(ccw);
+    sleep_for(seconds(5));
+
+    std::cout << "Wait for a bit\n";
+    offboard.set_velocity_body(stay);
+    sleep_for(seconds(2));
+
+    std::cout << "Fly a circle\n";
+    Offboard::VelocityBodyYawspeed circle{};
+    circle.forward_m_s = 5.0f;
+    circle.yawspeed_deg_s = 30.0f;
+    offboard.set_velocity_body(circle);
+    sleep_for(seconds(15));
+
+    std::cout << "Wait for a bit\n";
+    offboard.set_velocity_body(stay);
+    sleep_for(seconds(5));
+
+    std::cout << "Fly a circle sideways\n";
+    circle.right_m_s = -5.0f;
+    circle.yawspeed_deg_s = 30.0f;
+    offboard.set_velocity_body(circle);
+    sleep_for(seconds(15));
+
+    std::cout << "Wait for a bit\n";
+    offboard.set_velocity_body(stay);
+    sleep_for(seconds(8));
+
+    offboard_result = offboard.stop();
+    if (offboard_result != Offboard::Result::Success) {
+        std::cerr << "Offboard stop failed: " << offboard_result << '\n';
+        return false;
+    }
+    std::cout << "Offboard stopped\n";
+
+    return true;
+}
+
+//
+// Does Offboard control using attitude commands.
+//
+// returns true if everything went well in Offboard control.
+//
+bool offb_ctrl_attitude(mavsdk::Offboard& offboard)
+{
+    std::cout << "Starting Offboard attitude control\n";
+
+    // Send it once before starting offboard, otherwise it will be rejected.
+    Offboard::Attitude roll{};
+    roll.roll_deg = 30.0f;
+    roll.thrust_value = 0.6f;
+    offboard.set_attitude(roll);
+
+    Offboard::Result offboard_result = offboard.start();
+    if (offboard_result != Offboard::Result::Success) {
+        std::cerr << "Offboard start failed: " << offboard_result << '\n';
+        return false;
+    }
+    std::cout << "Offboard started\n";
+
+    std::cout << "Roll 30 degrees to the right\n";
+    offboard.set_attitude(roll);
+    sleep_for(seconds(2));
+
+    std::cout << "Stay horizontal\n";
+    roll.roll_deg = 0.0f;
+    offboard.set_attitude(roll);
+    sleep_for(seconds(1));
+
+    std::cout << "Roll 30 degrees to the left\n";
+    roll.roll_deg = -30.0f;
+    offboard.set_attitude(roll);
+    sleep_for(seconds(2));
+
+    std::cout << "Stay horizontal\n";
+    roll.roll_deg = 0.0f;
+    offboard.set_attitude(roll);
+    sleep_for(seconds(2));
+
+    offboard_result = offboard.stop();
+    if (offboard_result != Offboard::Result::Success) {
+        std::cerr << "Offboard stop failed: " << offboard_result << '\n';
+        return false;
+    }
+    std::cout << "Offboard stopped\n";
+
+    return true;
 }
 
 int main(int argc, char** argv)
@@ -78,132 +364,91 @@ int main(int argc, char** argv)
     }
 
     // Instantiate plugins.
-    auto telemetry = Telemetry{system};
     auto action = Action{system};
+    auto offboard = Offboard{system};
+    auto telemetry = Telemetry{system};
+    auto camera = Camera{system};
 
-
-    // We want to listen to the altitude of the drone at 1 Hz.
-    const auto set_rate_result = telemetry.set_rate_position(1.0);
-    if (set_rate_result != Telemetry::Result::Success) {
-        std::cerr << "Setting rate failed: " << set_rate_result << '\n';
-        return 1;
-    }
-
-
-    // Set up callback to monitor altitude while the vehicle is in flight
-    Telemetry::Position lat;
-
-
-    telemetry.subscribe_position([&lat](Telemetry::Position position) {
-        std::cout << "Altitude: " << position.relative_altitude_m << " m\n";
-        lat.latitude_deg = position.latitude_deg;
-        lat.absolute_altitude_m = position.absolute_altitude_m;
-        lat.longitude_deg = position.longitude_deg;
-        lat.relative_altitude_m = position.relative_altitude_m;
-    });
-
-
-
-    // Check until vehicle is ready to arm
-    while (telemetry.health_all_ok() != true) {
-        std::cout << "Vehicle is getting ready to arm\n";
+    while (!telemetry.health_all_ok()) {
+        std::cout << "Waiting for system to be ready\n";
         sleep_for(seconds(1));
     }
+    std::cout << "System is ready\n";
 
-    // Arm vehicle
-    std::cout << "Arming...\n";
-    const Action::Result arm_result = action.arm();
-
+    const auto arm_result = action.arm();
     if (arm_result != Action::Result::Success) {
         std::cerr << "Arming failed: " << arm_result << '\n';
         return 1;
     }
+    std::cout << "Armed\n";
 
-    // Take off
-    std::cout << "Taking off...\n";
-    const Action::Result takeoff_result = action.takeoff();
+    const auto takeoff_result = action.takeoff();
     if (takeoff_result != Action::Result::Success) {
         std::cerr << "Takeoff failed: " << takeoff_result << '\n';
         return 1;
     }
-sleep_for(seconds(10));
 
-
-
-    double xx = 0.001;
-    int sec = 10;
-    const Action::Result move_result = action.goto_location(
-                lat.latitude_deg+xx,
-                lat.longitude_deg,
-                lat.absolute_altitude_m,
-                0
-                );
-    sleep_for(seconds(sec));
-    if (move_result != Action::Result::Success) {
-        std::cerr << "Move failed: " << '\n';
+    auto in_air_promise = std::promise<void>{};
+    auto in_air_future = in_air_promise.get_future();
+    telemetry.subscribe_landed_state([&telemetry, &in_air_promise](Telemetry::LandedState state) {
+        if (state == Telemetry::LandedState::InAir) {
+            std::cout << "Taking off has finished\n.";
+            telemetry.subscribe_landed_state(nullptr);
+            in_air_promise.set_value();
+        }
+    });
+    in_air_future.wait_for(seconds(10));
+    if (in_air_future.wait_for(seconds(3)) == std::future_status::timeout) {
+        std::cerr << "Takeoff timed out.\n";
         return 1;
     }
-    sleep_for(seconds(sec));
 
+    //==============================
+    /* Camera Settings*/
+    const auto mode_result = camera.set_mode(Camera::Mode::Photo);
+        if (mode_result != Camera::Result::Success) {
+            std::cerr << "Could not switch to Photo mode: " << mode_result;
+            return 1;
+        }
 
+        // We want to subscribe to information about pictures that are taken.
+        camera.subscribe_capture_info([](Camera::CaptureInfo capture_info) {
+            std::cout << "Image captured, stored at: " << capture_info.file_url << '\n';
+        });
 
-    const Action::Result move_result2 = action.goto_location(
-                lat.latitude_deg,
-                lat.longitude_deg-xx,
-                lat.absolute_altitude_m,
-                0
-                );
-    sleep_for(seconds(sec));
-    if (move_result2 != Action::Result::Success) {
-        std::cerr << "Move failed: " << '\n';
+        const auto photo_result = camera.take_photo();
+        if (photo_result != Camera::Result::Success) {
+            std::cerr << "Taking Photo failed: " << mode_result;
+            return 1;
+        }
+
+        // Wait a bit to make sure we see capture information.
+        sleep_for(seconds(2));
+    //=============================
+
+    // using global position
+    if (!offb_ctrl_pos_global(offboard, telemetry)) {
         return 1;
     }
-    sleep_for(seconds(sec));
 
-
-    const Action::Result move_result3 = action.goto_location(
-                lat.latitude_deg-xx,
-                lat.longitude_deg,
-                lat.absolute_altitude_m,
-                0
-                );
-    sleep_for(seconds(sec));
-    if (move_result3 != Action::Result::Success) {
-        std::cerr << "Move failed: " << '\n';
+    //  using attitude control
+    if (!offb_ctrl_attitude(offboard)) {
         return 1;
     }
-    sleep_for(seconds(sec));
 
-
-    const Action::Result move_result4 = action.goto_location(
-                lat.latitude_deg,
-                lat.longitude_deg+xx,
-                lat.absolute_altitude_m,
-                0
-                );
-    sleep_for(seconds(sec));
-    if (move_result4 != Action::Result::Success) {
-        std::cerr << "Move failed: " << '\n';
+    //  using local NED co-ordinates
+    if (!offb_ctrl_ned(offboard)) {
         return 1;
     }
-    sleep_for(seconds(sec));
 
+    //  using body co-ordinates
+    if (!offb_ctrl_body(offboard)) {
+        return 1;
+    }
 
-
-
-
-
-
-
-
-
-
-
-    std::cout << "Landing...\n";
-
-    const Action::Result land_result = action.land();  //landing
+    const auto land_result = action.land();
     if (land_result != Action::Result::Success) {
-        std::cerr << "Land failed: " << land_result << '\n';
+        std::cerr << "Landing failed: " << land_result << '\n';
         return 1;
     }
 
@@ -211,20 +456,15 @@ sleep_for(seconds(10));
     while (telemetry.in_air()) {
         std::cout << "Vehicle is landing...\n";
         sleep_for(seconds(1));
-
-
-        telemetry.subscribe_landed_state([](Telemetry::LandedState the_state){
-           std::cout << "State: " << the_state << std::endl;
-        });
-
     }
-
-
     std::cout << "Landed!\n";
 
-    // We are relying on auto-disarming but let's keep watching the telemetry for a bit longer.
-    //sleep_for(seconds(3));
+    // We are relying on auto-disarming but let's keep watching the telemetry for
+    // a bit longer.
+    sleep_for(seconds(3));
     std::cout << "Finished...\n";
 
     return 0;
 }
+
+

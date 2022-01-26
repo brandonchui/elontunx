@@ -17,6 +17,8 @@ mavsdk/plugins/action/action.h
 -
 mavsdk/plugins/telemetry/telemetry.h
 -
+mavsdk/plugins/camera/camera.h
+-
 iostream
 -
 future
@@ -24,5 +26,7 @@ future
 memory
 -
 thread
+-
+mavsdk/plugins/offboard/offboard.h
 -
 
