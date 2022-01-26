@@ -84,7 +84,7 @@ std::shared_ptr<System> get_system(Mavsdk& mavsdk)
 // Does Offboard control using NED co-ordinates.
 //
 // returns true if everything went well in Offboard control
-//
+//s
 bool offb_ctrl_ned(mavsdk::Offboard& offboard)
 {
     std::cout << "Starting Offboard velocity control in NED coordinates\n";
